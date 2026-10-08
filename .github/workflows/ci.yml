@@ -23,6 +23,7 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
+    environment: "Docker Hub Credentials"
 
     steps:
       - name: Login to Docker Hub
