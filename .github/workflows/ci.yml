@@ -28,7 +28,5 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build application
-        run: |
-          echo "Building application..."
-          echo "Build successful!"
+      - name: Build Docker image
+        run: docker build -t cicd-demo:v1 .
