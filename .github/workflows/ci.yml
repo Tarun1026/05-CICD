@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        
+
       - name: Login to Docker Hub
         uses: docker/login-action@v4
         with:
@@ -40,4 +40,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ vars.DOCKERHUB_USERNAME }}/cicd-demo:v1
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/cicd-demo:${{ github.sha }}
