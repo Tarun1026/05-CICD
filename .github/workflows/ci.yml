@@ -19,3 +19,16 @@ jobs:
         run: |
           echo "Running CI test..."
           grep -q "Hello from CI/CD lab" app.txt
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build application
+        run: |
+          echo "Building application..."
+          echo "Build successful!"
