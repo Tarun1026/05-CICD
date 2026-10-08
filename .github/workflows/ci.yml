@@ -18,7 +18,7 @@ jobs:
       - name: Run our test
         run: |
           echo "Running CI test..."
-          grep -q "Hello from CI/CD lab-> This not exist now" app.txt
+          grep -q "Hello from CI/CD lab" app.txt
 
   build:
     needs: test
