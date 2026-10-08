@@ -21,7 +21,7 @@ jobs:
           grep -q "Hello from CI/CD lab" app.txt
 
   build:
-    needs: test
+    needs: Run our test
     runs-on: ubuntu-latest
 
     steps:
