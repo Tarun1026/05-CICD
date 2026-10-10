@@ -71,17 +71,24 @@ jobs:
           IMAGE="${DOCKERHUB_USERNAME}/cicd-demo:${IMAGE_TAG}"
           echo "Deploying image: ${IMAGE}"
 
-          PARAMETERS=$(jq -cn --arg image "$IMAGE" '{
-            commands: [
-              "set -e",
-              ("docker pull " + $image),
-              "docker stop cicd-demo-app 2>/dev/null || true",
-              "docker rm cicd-demo-app 2>/dev/null || true",
-              ("docker run -d --restart unless-stopped --name cicd-demo-app -p 80:80 " + $image),
-              "docker ps --filter name=cicd-demo-app",
-              "for i in \$(seq 1 10); do curl --fail --silent --show-error --max-time 5 http://localhost/app.txt && exit 0; echo 'Health check failed; retrying...'; sleep 3; done; exit 1"
-            ]
-          }')
+          
+          HEALTH_CHECK='for i in $(seq 1 10); do curl --fail --silent --show-error --max-time 5 http://localhost/app.txt && exit 0; echo "Health check failed; retrying..."; sleep 3; done; exit 1'
+
+          PARAMETERS=$(jq -cn \
+            --arg image "$IMAGE" \
+            --arg health_check "$HEALTH_CHECK" \
+            '{
+              commands: [
+                "set -e",
+                ("docker pull " + $image),
+                "docker stop cicd-demo-app 2>/dev/null || true",
+                "docker rm cicd-demo-app 2>/dev/null || true",
+                ("docker run -d --restart unless-stopped --name cicd-demo-app -p 80:80 " + $image),
+                "docker ps --filter name=cicd-demo-app",
+                $health_check
+              ]
+            }')
+
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
