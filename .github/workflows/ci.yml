@@ -40,4 +40,57 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ vars.DOCKERHUB_USERNAME }}/cicd-demo:${{ github.sha }}
+          tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/cicd-demo:${{ github.sha }}
+            ${{ vars.DOCKERHUB_USERNAME }}/cicd-demo:latest
+
+  deploy:
+    name: Deploy to AWS EC2
+    needs: build
+    runs-on: ubuntu-latest
+    environment: "Docker Hub Credentials"
+
+    steps:
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy Docker image to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="${DOCKERHUB_USERNAME}/cicd-demo:${IMAGE_TAG}"
+
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "${EC2_USERNAME}@${EC2_HOST}" \
+            "IMAGE='${IMAGE}' bash -s" <<'REMOTE'
+              set -e
+
+              docker pull "$IMAGE"
+
+              docker stop cicd-demo-app 2>/dev/null || true
+              docker rm cicd-demo-app 2>/dev/null || true
+
+              docker run -d \
+                --restart unless-stopped \
+                --name cicd-demo-app \
+                -p 80:80 \
+                "$IMAGE"
+
+              docker ps --filter name=cicd-demo-app
+
+              curl --fail --retry 5 --retry-delay 2 \
+                http://localhost/app.txt
+          REMOTE
