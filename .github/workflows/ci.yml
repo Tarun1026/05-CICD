@@ -56,12 +56,38 @@ jobs:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
+          set -e
+
+          echo "Checking required secrets..."
+
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "ERROR: EC2_SSH_KEY is empty or unavailable"
+            exit 1
+          fi
+
+          if [ -z "$EC2_HOST" ]; then
+            echo "ERROR: EC2_HOST is empty or unavailable"
+            exit 1
+          fi
+
+          echo "Both secrets are present"
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
           chmod 600 ~/.ssh/ec2_key
 
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          echo "Validating private key..."
+          ssh-keygen -y -f ~/.ssh/ec2_key > /dev/null
+
+          echo "Testing SSH host-key discovery..."
+          if ! ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>&1; then
+            echo "ERROR: Cannot retrieve SSH host key from EC2"
+            exit 1
+          fi
+
+          echo "SSH configuration completed"
 
       - name: Deploy Docker image to EC2
         env:
