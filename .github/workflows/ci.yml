@@ -71,7 +71,7 @@ jobs:
           if timeout 10 bash -c 'echo > /dev/tcp/$1/22' _ "$EC2_HOST"; then
             echo "TCP port 22 is reachable"
           else
-            echo "TCP port 22 is NOT reachable from GitHub Actions"
+            echo "Is still TCP port 22 is NOT reachable from GitHub Actions"
             exit 1
           fi
 
