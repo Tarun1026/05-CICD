@@ -79,7 +79,7 @@ jobs:
               "docker rm cicd-demo-app 2>/dev/null || true",
               ("docker run -d --restart unless-stopped --name cicd-demo-app -p 80:80 " + $image),
               "docker ps --filter name=cicd-demo-app",
-              "curl --fail --retry 5 --retry-delay 2 http://localhost/app.txt"
+              "for i in \$(seq 1 10); do curl --fail --silent --show-error --max-time 5 http://localhost/app.txt && exit 0; echo 'Health check failed; retrying...'; sleep 3; done; exit 1"
             ]
           }')
 
