@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+IMAGE="${1:?Usage: deploy-blue-green.sh IMAGE EXPECTED_CONTENT}"
+EXPECTED_CONTENT="${2:?Expected app.txt content is required}"
+
+CONFIG="/home/ubuntu/blue-green/nginx/default.conf"
+CONFIG_DIR="$(dirname "$CONFIG")"
+NETWORK="blue-green-net"
+
+mkdir -p "$CONFIG_DIR"
+
+# Ensure the application and proxy can communicate.
+if ! docker network inspect "$NETWORK" >/dev/null 2>&1; then
+    docker network create "$NETWORK"
+fi
+
+# Determine whether an existing Blue-Green deployment is active.
+ACTIVE=""
+
+if docker ps --format '{{.Names}}' | grep -qx 'nginx-proxy' \
+    && [[ -f "$CONFIG" ]]; then
+    if grep -Fq 'proxy_pass http://cicd-blue:80;' "$CONFIG"; then
+        ACTIVE="blue"
+    elif grep -Fq 'proxy_pass http://cicd-green:80;' "$CONFIG"; then
+        ACTIVE="green"
+    fi
+fi
+
+if [[ -z "$ACTIVE" ]]; then
+    BOOTSTRAP=true
+    TARGET="blue"
+    PORT="8081"
+    echo "First deployment: initializing Blue."
+else
+    BOOTSTRAP=false
+
+    if [[ "$ACTIVE" == "blue" ]]; then
+        TARGET="green"
+        PORT="8082"
+    else
+        TARGET="blue"
+        PORT="8081"
+    fi
+
+    echo "Active slot: $ACTIVE"
+    echo "Deployment target: $TARGET"
+fi
+
+echo "Pulling image: $IMAGE"
+docker pull "$IMAGE"
+
+# Start the new application in the target slot.
+docker rm -f "cicd-${TARGET}" 2>/dev/null || true
+
+docker run -d \
+    --name "cicd-${TARGET}" \
+    --restart unless-stopped \
+    --network "$NETWORK" \
+    -p "127.0.0.1:${PORT}:80" \
+    "$IMAGE"
+
+# Do not switch production traffic unless the target passes its check.
+HEALTHY=false
+
+for attempt in $(seq 1 10); do
+    ACTUAL="$(curl -fsS --max-time 5 \
+        "http://127.0.0.1:${PORT}/app.txt" 2>/dev/null || true)"
+
+    if [[ "$ACTUAL" == "$EXPECTED_CONTENT" ]]; then
+        HEALTHY=true
+        break
+    fi
+
+    echo "Target health check ${attempt}/10 failed."
+    sleep 3
+done
+
+if [[ "$HEALTHY" != true ]]; then
+    echo "ERROR: Target failed its health check."
+    echo "Existing production traffic has not been switched."
+    exit 1
+fi
+
+echo "Target passed its health check."
+
+# Preserve the existing routing configuration for rollback.
+BACKUP=""
+if [[ "$BOOTSTRAP" == false ]]; then
+    BACKUP="$(mktemp)"
+    cp "$CONFIG" "$BACKUP"
+fi
+
+write_config() {
+    local slot="$1"
+
+    cat > "$CONFIG" <<NGINX
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://cicd-${slot}:80;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+}
+
+rollback() {
+    if [[ -n "$BACKUP" && -f "$BACKUP" ]]; then
+        echo "Restoring previous Nginx configuration."
+        cat "$BACKUP" > "$CONFIG"
+
+        if docker exec nginx-proxy nginx -t; then
+            docker exec nginx-proxy nginx -s reload || true
+        fi
+    fi
+}
+
+# Configure the new upstream.
+write_config "$TARGET"
+
+if [[ "$BOOTSTRAP" == true ]]; then
+    # Create the proxy only after the first app passes its check.
+    # Remove a stale, stopped proxy container if one exists.
+    docker rm -f nginx-proxy 2>/dev/null || true
+
+    if ! docker run -d \
+        --name nginx-proxy \
+        --restart unless-stopped \
+        --network "$NETWORK" \
+        -p 80:80 \
+        -v "$CONFIG:/etc/nginx/conf.d/default.conf:ro" \
+        nginx:alpine; then
+        echo "ERROR: Could not start the initial Nginx proxy."
+        exit 1
+    fi
+else
+    if ! docker exec nginx-proxy nginx -t; then
+        echo "ERROR: New Nginx configuration is invalid."
+        rollback
+        rm -f "$BACKUP"
+        exit 1
+    fi
+
+    if ! docker exec nginx-proxy nginx -s reload; then
+        echo "ERROR: Nginx reload failed."
+        rollback
+        rm -f "$BACKUP"
+        exit 1
+    fi
+fi
+
+# Verify traffic through the production endpoint.
+ACTUAL="$(curl -fsS --max-time 5 \
+    http://127.0.0.1/app.txt 2>/dev/null || true)"
+
+if [[ "$ACTUAL" != "$EXPECTED_CONTENT" ]]; then
+    echo "ERROR: Production verification failed."
+
+    if [[ "$BOOTSTRAP" == true ]]; then
+        docker rm -f nginx-proxy 2>/dev/null || true
+    else
+        rollback
+    fi
+
+    rm -f "${BACKUP:-}"
+    exit 1
+fi
+
+rm -f "${BACKUP:-}"
+
+echo "SUCCESS: $TARGET is serving production traffic."
+if [[ "$BOOTSTRAP" == false ]]; then
+    echo "Previous slot $ACTIVE remains available for rollback."
+fi
