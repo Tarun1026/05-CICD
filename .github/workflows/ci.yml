@@ -84,7 +84,7 @@ jobs:
             --arg expected "$APP_CONTENT" \
             '{
               commands: [
-                "set -euo pipefail",
+                "set -eu",
                 ("printf %s " + ($script_b64 | @sh) + " | base64 -d > /tmp/deploy-blue-green.sh"),
                 "chmod +x /tmp/deploy-blue-green.sh",
                 ("bash /tmp/deploy-blue-green.sh " + ($image | @sh) + " " + ($expected | @sh))
