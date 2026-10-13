@@ -157,11 +157,24 @@ else
 fi
 
 # Verify traffic through the production endpoint.
-ACTUAL="$(curl -fsS --max-time 5 \
-    http://127.0.0.1/app.txt 2>/dev/null || true)"
+# Verify production traffic with retries after the proxy switch.
+PRODUCTION_HEALTHY=false
 
-if [[ "$ACTUAL" != "$EXPECTED_CONTENT" ]]; then
-    echo "ERROR: Production verification failed."
+for attempt in $(seq 1 10); do
+    ACTUAL="$(curl -fsS --max-time 5 \
+        http://127.0.0.1/app.txt 2>/dev/null || true)"
+
+    if [[ "$ACTUAL" == "$EXPECTED_CONTENT" ]]; then
+        PRODUCTION_HEALTHY=true
+        break
+    fi
+
+    echo "Production health check ${attempt}/10 failed; retrying."
+    sleep 2
+done
+
+if [[ "$PRODUCTION_HEALTHY" != true ]]; then
+    echo "ERROR: Production verification failed after retries."
 
     if [[ "$BOOTSTRAP" == true ]]; then
         docker rm -f nginx-proxy 2>/dev/null || true
