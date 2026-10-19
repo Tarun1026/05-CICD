@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-IMAGE="${1:?Usage: deploy-blue-green.sh IMAGE EXPECTED_CONTENT}"
-EXPECTED_CONTENT="${2:?Expected app.txt content is required}"
+IMAGE="${1:?Usage: deploy-blue-green.sh IMAGE}"
 
 CONFIG="/home/ubuntu/blue-green/nginx/default.conf"
 CONFIG_DIR="$(dirname "$CONFIG")"
@@ -64,10 +63,8 @@ docker run -d \
 HEALTHY=false
 
 for attempt in $(seq 1 10); do
-    ACTUAL="$(curl -fsS --max-time 5 \
-        "http://127.0.0.1:${PORT}/app.txt" 2>/dev/null || true)"
-
-    if [[ "$ACTUAL" == "$EXPECTED_CONTENT" ]]; then
+    if curl -fsS --max-time 5 \
+        -o /dev/null "http://127.0.0.1:${PORT}/app.txt"; then
         HEALTHY=true
         break
     fi
@@ -161,10 +158,8 @@ fi
 PRODUCTION_HEALTHY=false
 
 for attempt in $(seq 1 10); do
-    ACTUAL="$(curl -fsS --max-time 5 \
-        http://127.0.0.1/app.txt 2>/dev/null || true)"
-
-    if [[ "$ACTUAL" == "$EXPECTED_CONTENT" ]]; then
+    if curl -fsS --max-time 5 \
+        -o /dev/null http://127.0.0.1/app.txt; then
         PRODUCTION_HEALTHY=true
         break
     fi

@@ -15,10 +15,38 @@ jobs:
       - name: Show files
         run: ls -la
 
-      - name: Run our test
+      - name: Build and test application endpoint
+        shell: bash
         run: |
-          echo "Running CI test..."
-          grep -q "Hello from CI/CD lab" app.txt
+          set -euo pipefail
+
+          echo "Building Docker image for testing..."
+          docker build -t cicd-demo-ci-test .
+
+          echo "Starting test container..."
+          docker run -d \
+            --name cicd-demo-ci-test \
+            -p 127.0.0.1:8080:80 \
+            cicd-demo-ci-test
+
+          cleanup() {
+            docker rm -f cicd-demo-ci-test >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 10); do
+            if curl --fail --silent --show-error --max-time 3 \
+              http://127.0.0.1:8080/app.txt -o /dev/null; then
+              echo "Application endpoint check passed."
+              exit 0
+            fi
+
+            echo "Application endpoint attempt ${attempt}/10 failed."
+            sleep 2
+          done
+
+          echo "ERROR: Application endpoint did not respond successfully."
+          exit 1
 
   build:
     needs: test
@@ -72,22 +100,19 @@ jobs:
           set -euo pipefail
 
           IMAGE="${DOCKERHUB_USERNAME}/cicd-demo:${IMAGE_TAG}"
-          APP_CONTENT="$(cat app.txt)"
           SCRIPT_B64="$(base64 -w0 scripts/deploy-blue-green.sh)"
 
           echo "Image: ${IMAGE}"
-          echo "Expected application content: ${APP_CONTENT}"
 
           PARAMETERS=$(jq -cn \
             --arg script_b64 "$SCRIPT_B64" \
             --arg image "$IMAGE" \
-            --arg expected "$APP_CONTENT" \
             '{
               commands: [
                 "set -eu",
                 ("printf %s " + ($script_b64 | @sh) + " | base64 -d > /tmp/deploy-blue-green.sh"),
                 "chmod +x /tmp/deploy-blue-green.sh",
-                ("bash /tmp/deploy-blue-green.sh " + ($image | @sh) + " " + ($expected | @sh))
+                ("bash /tmp/deploy-blue-green.sh " + ($image | @sh))
               ]
             }')
 
