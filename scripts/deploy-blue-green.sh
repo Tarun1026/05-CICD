@@ -187,7 +187,7 @@ restore_route() {
 
 if [[ "$BOOTSTRAP" == true ]]; then
   if ! docker run -d --name "$PROXY" --restart unless-stopped --network "$NETWORK" \
-    -p 80:80 -v "$CONFIG:/etc/nginx/conf.d/default.conf:ro" nginx:alpine >/dev/null; then
+    -p 80:80 -v "$ROOT/nginx:/etc/nginx/conf.d:ro" nginx:alpine >/dev/null; then
     echo "ERROR: Could not start initial proxy."
     exit 1
   fi
