@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+IMAGE="${1:?Usage: deploy-blue-green.sh IMAGE}"
+
+CONFIG="/home/ubuntu/blue-green/nginx/default.conf"
+CONFIG_DIR="$(dirname "$CONFIG")"
+NETWORK="blue-green-net"
+
+mkdir -p "$CONFIG_DIR"
+
+# Ensure the application and proxy can communicate.
+if ! docker network inspect "$NETWORK" >/dev/null 2>&1; then
+    docker network create "$NETWORK"
+fi
+
+# Determine whether an existing Blue-Green deployment is active.
+ACTIVE=""
+
+if docker ps --format '{{.Names}}' | grep -qx 'nginx-proxy' \
+    && [[ -f "$CONFIG" ]]; then
+    if grep -Fq 'proxy_pass http://cicd-blue:80;' "$CONFIG"; then
+        ACTIVE="blue"
+    elif grep -Fq 'proxy_pass http://cicd-green:80;' "$CONFIG"; then
+        ACTIVE="green"
+    fi
+fi
+
+if [[ -z "$ACTIVE" ]]; then
+    BOOTSTRAP=true
+    TARGET="blue"
+    PORT="8081"
+    echo "First deployment: initializing Blue."
+else
+    BOOTSTRAP=false
+
+    if [[ "$ACTIVE" == "blue" ]]; then
+        TARGET="green"
+        PORT="8082"
+    else
+        TARGET="blue"
+        PORT="8081"
+    fi
+
+    echo "Active slot: $ACTIVE"
+    echo "Deployment target: $TARGET"
+fi
+
+echo "Pulling image: $IMAGE"
+docker pull "$IMAGE"
+
+# Record the target slot's current image before replacing it.
+TARGET_CONTAINER="cicd-${TARGET}"
+OLD_TARGET_IMAGE=""
+
+if docker container inspect "$TARGET_CONTAINER" >/dev/null 2>&1; then
+    OLD_TARGET_IMAGE=$(docker inspect \
+        --format '{{.Config.Image}}' "$TARGET_CONTAINER")
+    echo "Previous target image recorded: $OLD_TARGET_IMAGE"
+else
+    echo "No existing container in target slot."
+fi
+
+# Remove the old target only after recording its image reference.
+docker rm -f "$TARGET_CONTAINER" 2>/dev/null || true
+
+if ! docker run -d \
+    --name "$TARGET_CONTAINER" \
+    --restart unless-stopped \
+    --network "$NETWORK" \
+    -p "127.0.0.1:${PORT}:80" \
+    "$IMAGE"; then
+
+    echo "ERROR: Candidate container could not start."
+
+    if [[ -n "$OLD_TARGET_IMAGE" ]]; then
+        echo "Attempting to restore previous target image: $OLD_TARGET_IMAGE"
+
+        if ! docker image inspect "$OLD_TARGET_IMAGE" >/dev/null 2>&1; then
+            docker pull "$OLD_TARGET_IMAGE" || {
+                echo "CRITICAL: Could not retrieve the previous image."
+                exit 1
+            }
+        fi
+
+        docker run -d \
+            --name "$TARGET_CONTAINER" \
+            --restart unless-stopped \
+            --network "$NETWORK" \
+            -p "127.0.0.1:${PORT}:80" \
+            "$OLD_TARGET_IMAGE" || {
+                echo "CRITICAL: Could not recreate the previous container."
+                exit 1
+            }
+
+        echo "Previous target container recreated."
+    else
+        echo "No previous target image is available for recovery."
+    fi
+
+    exit 1
+fi
+
+# Do not switch production traffic unless the target passes its health check.
+HEALTHY=false
+
+for attempt in $(seq 1 10); do
+    if curl --fail --silent --show-error --max-time 5 \
+        -o /dev/null "http://127.0.0.1:${PORT}/health"; then
+        HEALTHY=true
+        break
+    fi
+
+    echo "Target health check ${attempt}/10 failed."
+    sleep 3
+done
+
+if [[ "$HEALTHY" != true ]]; then
+    echo "ERROR: Target failed its health check."
+    echo "Existing production traffic has not been switched."
+
+    # Restore the previous target container if we recorded its image.
+    if [[ -n "$OLD_TARGET_IMAGE" ]]; then
+        echo "Restoring previous target image: $OLD_TARGET_IMAGE"
+        if ! docker image inspect "$OLD_TARGET_IMAGE" >/dev/null 2>&1; then
+            echo "Previous image is not local; attempting to pull it."
+
+            if ! docker pull "$OLD_TARGET_IMAGE"; then
+                echo "CRITICAL: Could not retrieve the previous target image."
+                exit 1
+            fi
+        fi
+
+        docker run -d \
+            --name "$TARGET_CONTAINER" \
+            --restart unless-stopped \
+            --network "$NETWORK" \
+            -p "127.0.0.1:${PORT}:80" \
+            "$OLD_TARGET_IMAGE"
+
+        RESTORED=false
+        for attempt in $(seq 1 10); do
+            if curl --fail --silent --show-error --max-time 5 \
+                -o /dev/null "http://127.0.0.1:${PORT}/health"; then
+                RESTORED=true
+                break
+            fi
+
+            echo "Recovery health check ${attempt}/10 failed."
+            sleep 3
+        done
+
+        if [[ "$RESTORED" == true ]]; then
+            echo "Previous target container restored and healthy."
+        else
+            echo "CRITICAL: Previous target image was recreated but is not healthy."
+        fi
+    else
+        echo "No previous target image was recorded; nothing to restore."
+    fi
+
+    exit 1
+fi
+
+echo "Target passed its health check."
+
+# Preserve the existing routing configuration for rollback.
+BACKUP=""
+if [[ "$BOOTSTRAP" == false ]]; then
+    BACKUP="$(mktemp)"
+    cp "$CONFIG" "$BACKUP"
+fi
+
+write_config() {
+    local slot="$1"
+
+    cat > "$CONFIG" <<NGINX
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://cicd-${slot}:80;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+}
+
+rollback() {
+    if [[ -n "$BACKUP" && -f "$BACKUP" ]]; then
+        echo "Restoring previous Nginx configuration."
+        cat "$BACKUP" > "$CONFIG"
+
+        if docker exec nginx-proxy nginx -t; then
+            docker exec nginx-proxy nginx -s reload || true
+        fi
+    fi
+}
+
+# Configure the new upstream.
+write_config "$TARGET"
+
+if [[ "$BOOTSTRAP" == true ]]; then
+    # Create the proxy only after the first app passes its check.
+    # Remove a stale, stopped proxy container if one exists.
+    docker rm -f nginx-proxy 2>/dev/null || true
+
+    if ! docker run -d \
+        --name nginx-proxy \
+        --restart unless-stopped \
+        --network "$NETWORK" \
+        -p 80:80 \
+        -v "$CONFIG:/etc/nginx/conf.d/default.conf:ro" \
+        nginx:alpine; then
+        echo "ERROR: Could not start the initial Nginx proxy."
+        exit 1
+    fi
+else
+    if ! docker exec nginx-proxy nginx -t; then
+        echo "ERROR: New Nginx configuration is invalid."
+        rollback
+        rm -f "$BACKUP"
+        exit 1
+    fi
+
+    if ! docker exec nginx-proxy nginx -s reload; then
+        echo "ERROR: Nginx reload failed."
+        rollback
+        rm -f "$BACKUP"
+        exit 1
+    fi
+fi
+
+# Verify traffic through the production endpoint.
+# Verify production traffic with retries after the proxy switch.
+PRODUCTION_HEALTHY=false
+
+for attempt in $(seq 1 10); do
+    if curl --fail --silent --show-error --max-time 5 \
+        -o /dev/null http://127.0.0.1/health; then
+        PRODUCTION_HEALTHY=true
+        break
+    fi
+
+    echo "Production health check ${attempt}/10 failed; retrying."
+    sleep 2
+done
+
+if [[ "$PRODUCTION_HEALTHY" != true ]]; then
+    echo "ERROR: Production verification failed after retries."
+
+    if [[ "$BOOTSTRAP" == true ]]; then
+        docker rm -f nginx-proxy 2>/dev/null || true
+    else
+        rollback
+    fi
+
+    rm -f "${BACKUP:-}"
+    exit 1
+fi
+
+rm -f "${BACKUP:-}"
+
+echo "SUCCESS: $TARGET is serving production traffic."
+if [[ "$BOOTSTRAP" == false ]]; then
+    echo "Previous slot $ACTIVE remains available for rollback."
+fi
