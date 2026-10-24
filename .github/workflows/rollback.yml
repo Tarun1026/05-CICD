@@ -1,0 +1,88 @@
+name: Manual Blue-Green Rollback
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    name: Roll back production through SSM
+    runs-on: ubuntu-latest
+    environment: "Docker Hub Credentials"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Run rollback on EC2 through SSM
+        env:
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT_B64="$(base64 -w0 scripts/rollback-app.sh)"
+
+          PARAMETERS=$(jq -cn \
+            --arg script_b64 "$SCRIPT_B64" \
+            '{
+              commands: [
+                "set -eu",
+                ("printf %s " + ($script_b64 | @sh) + " | base64 -d > /tmp/rollback-app.sh"),
+                "chmod 700 /tmp/rollback-app.sh",
+                "bash /tmp/rollback-app.sh"
+              ]
+            }')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Manual Blue-Green rollback" \
+            --parameters "$PARAMETERS" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command ID: $COMMAND_ID"
+
+          for attempt in $(seq 1 36); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)
+
+            echo "Rollback status: ${STATUS:-Pending}"
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '{Status:Status,Error:StandardErrorContent,Output:StandardOutputContent}' \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for the SSM rollback command."
+          exit 1

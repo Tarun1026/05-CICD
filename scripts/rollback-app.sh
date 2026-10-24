@@ -61,6 +61,22 @@ ACTIVE_IMAGE_ID=$(jq -r '.active.image_id // empty' "$RELEASES")
 ACTIVE_DIGEST=$(jq -r '.active.digest // empty' "$RELEASES")
 ACTIVE_EXPECTED=$(jq -r '.active.expected // empty' "$RELEASES")
 
+# Ensure saved metadata agrees with the live production route.
+if grep -Fq 'proxy_pass http://cicd-blue:80;' "$CONFIG"; then
+    LIVE_SLOT="blue"
+elif grep -Fq 'proxy_pass http://cicd-green:80;' "$CONFIG"; then
+    LIVE_SLOT="green"
+else
+    echo "ERROR: Cannot determine live production slot from Nginx config."
+    exit 1
+fi
+
+if [[ "$LIVE_SLOT" != "$ACTIVE_SLOT" ]]; then
+    echo "ERROR: Live route ($LIVE_SLOT) disagrees with metadata ($ACTIVE_SLOT)."
+    echo "Refusing rollback to avoid acting on stale release state."
+    exit 1
+fi
+
 [[ "$PREVIOUS_SLOT" == "blue" || "$PREVIOUS_SLOT" == "green" ]] || {
     echo "ERROR: No valid previous slot recorded."
     exit 1
