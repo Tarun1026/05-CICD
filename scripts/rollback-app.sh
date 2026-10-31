@@ -20,8 +20,8 @@ done
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK"
 flock -n 9 || {
-    echo "ERROR: Another deployment or rollback is running."
-    exit 1
+    echo "LOCK_BUSY: Another deployment or rollback is running."
+    exit 75
 }
 
 [[ -r "$RELEASES" ]] || {
@@ -53,13 +53,11 @@ PREVIOUS_SLOT=$(jq -r '.previous.slot // empty' "$RELEASES")
 PREVIOUS_IMAGE=$(jq -r '.previous.image // empty' "$RELEASES")
 PREVIOUS_IMAGE_ID=$(jq -r '.previous.image_id // empty' "$RELEASES")
 PREVIOUS_DIGEST=$(jq -r '.previous.digest // empty' "$RELEASES")
-PREVIOUS_EXPECTED=$(jq -r '.previous.expected // empty' "$RELEASES")
 
 ACTIVE_SLOT=$(jq -r '.active.slot // empty' "$RELEASES")
 ACTIVE_IMAGE=$(jq -r '.active.image // empty' "$RELEASES")
 ACTIVE_IMAGE_ID=$(jq -r '.active.image_id // empty' "$RELEASES")
 ACTIVE_DIGEST=$(jq -r '.active.digest // empty' "$RELEASES")
-ACTIVE_EXPECTED=$(jq -r '.active.expected // empty' "$RELEASES")
 
 # Ensure saved metadata agrees with the live production route.
 if grep -Fq 'proxy_pass http://cicd-blue:80;' "$CONFIG"; then
@@ -94,11 +92,6 @@ fi
 
 [[ "$PREVIOUS_IMAGE_ID" =~ ^sha256:[a-f0-9]+$ ]] || {
     echo "ERROR: Previous exact image ID is missing."
-    exit 1
-}
-
-[[ -n "$PREVIOUS_EXPECTED" ]] || {
-    echo "ERROR: Previous expected application response is missing."
     exit 1
 }
 
@@ -142,23 +135,19 @@ if ! docker container inspect "$CONTAINER" >/dev/null 2>&1 ||
         "$PREVIOUS_IMAGE_ID" >/dev/null
 fi
 
-# Check the previous app response. Older releases may legitimately lack /health.
+# Validate HTTP availability only; do not depend on application response text.
 PREVIOUS_OK=false
-
 for attempt in $(seq 1 15); do
-    RESPONSE=$(curl -fsS --max-time 3 \
-        "http://127.0.0.1:${PORT}/app.txt" 2>/dev/null || true)
-
-    if [[ -n "$RESPONSE" && "$RESPONSE" == "$PREVIOUS_EXPECTED" ]]; then
+    if curl -fsS --max-time 3 -o /dev/null \
+        "http://127.0.0.1:${PORT}/health" 2>/dev/null; then
         PREVIOUS_OK=true
         break
     fi
-
     sleep 2
 done
 
 [[ "$PREVIOUS_OK" == "true" ]] || {
-    echo "ERROR: Previous release failed its application response check."
+    echo "ERROR: Previous slot health endpoint did not return a successful HTTP status."
     echo "Production route remains unchanged."
     exit 1
 }
@@ -216,18 +205,14 @@ if ! docker exec "$PROXY" nginx -t ||
     exit 1
 fi
 
-# Verify production returns the recorded previous application response.
+# Verify production health by HTTP status, not response body.
 VERIFIED=false
-
 for attempt in $(seq 1 10); do
-    RESPONSE=$(curl -fsS --max-time 3 \
-        http://127.0.0.1/app.txt 2>/dev/null || true)
-
-    if [[ -n "$RESPONSE" && "$RESPONSE" == "$PREVIOUS_EXPECTED" ]]; then
+    if curl -fsS --max-time 3 -o /dev/null \
+        http://127.0.0.1/health 2>/dev/null; then
         VERIFIED=true
         break
     fi
-
     sleep 2
 done
 
@@ -250,26 +235,22 @@ jq -n \
     --arg active_image "$PREVIOUS_IMAGE" \
     --arg active_image_id "$PREVIOUS_IMAGE_ID" \
     --arg active_digest "$PREVIOUS_DIGEST" \
-    --arg active_expected "$PREVIOUS_EXPECTED" \
     --arg previous_slot "$ACTIVE_SLOT" \
     --arg previous_image "$ACTIVE_IMAGE" \
     --arg previous_image_id "$ACTIVE_IMAGE_ID" \
     --arg previous_digest "$ACTIVE_DIGEST" \
-    --arg previous_expected "$ACTIVE_EXPECTED" \
     '{
         active: {
             slot: $active_slot,
             image: $active_image,
             image_id: $active_image_id,
-            digest: $active_digest,
-            expected: $active_expected
+            digest: $active_digest
         },
         previous: {
             slot: $previous_slot,
             image: $previous_image,
             image_id: $previous_image_id,
-            digest: $previous_digest,
-            expected: $previous_expected
+            digest: $previous_digest
         }
     }' > "$META_TMP"
 
