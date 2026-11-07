@@ -9,8 +9,12 @@ RELEASES="$STATE_DIR/releases.json"
 NETWORK="blue-green-net"
 PROXY="nginx-proxy"
 LOCK="/var/lock/cicd-blue-green-deploy.lock"
+CONTAINER_PORT=8080
+PUBLIC_URL="http://127.0.0.1"
+HEALTH_PATH="/health/ready"
+source "$(dirname "$0")/transaction-lib.sh"
 
-for cmd in docker curl flock jq mktemp; do
+for cmd in docker curl flock jq mktemp seq base64 install; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Missing command: $cmd"
         exit 1
@@ -20,9 +24,12 @@ done
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK"
 flock -n 9 || {
-    echo "ERROR: Another deployment or rollback is running."
-    exit 1
+    echo "LOCK_BUSY: Another deployment or rollback is running."
+    exit 75
 }
+
+# Recover an interrupted route/metadata transaction before reading release state.
+txn_recover
 
 [[ -r "$RELEASES" ]] || {
     echo "ERROR: Missing release metadata; refusing rollback."
@@ -53,18 +60,16 @@ PREVIOUS_SLOT=$(jq -r '.previous.slot // empty' "$RELEASES")
 PREVIOUS_IMAGE=$(jq -r '.previous.image // empty' "$RELEASES")
 PREVIOUS_IMAGE_ID=$(jq -r '.previous.image_id // empty' "$RELEASES")
 PREVIOUS_DIGEST=$(jq -r '.previous.digest // empty' "$RELEASES")
-PREVIOUS_EXPECTED=$(jq -r '.previous.expected // empty' "$RELEASES")
 
 ACTIVE_SLOT=$(jq -r '.active.slot // empty' "$RELEASES")
 ACTIVE_IMAGE=$(jq -r '.active.image // empty' "$RELEASES")
 ACTIVE_IMAGE_ID=$(jq -r '.active.image_id // empty' "$RELEASES")
 ACTIVE_DIGEST=$(jq -r '.active.digest // empty' "$RELEASES")
-ACTIVE_EXPECTED=$(jq -r '.active.expected // empty' "$RELEASES")
 
 # Ensure saved metadata agrees with the live production route.
-if grep -Fq 'proxy_pass http://cicd-blue:80;' "$CONFIG"; then
+if grep -Fq 'proxy_pass http://cicd-blue:8080;' "$CONFIG"; then
     LIVE_SLOT="blue"
-elif grep -Fq 'proxy_pass http://cicd-green:80;' "$CONFIG"; then
+elif grep -Fq 'proxy_pass http://cicd-green:8080;' "$CONFIG"; then
     LIVE_SLOT="green"
 else
     echo "ERROR: Cannot determine live production slot from Nginx config."
@@ -97,11 +102,6 @@ fi
     exit 1
 }
 
-[[ -n "$PREVIOUS_EXPECTED" ]] || {
-    echo "ERROR: Previous expected application response is missing."
-    exit 1
-}
-
 case "$PREVIOUS_SLOT" in
     blue) PORT=8081 ;;
     green) PORT=8082 ;;
@@ -126,9 +126,18 @@ if ! docker image inspect "$PREVIOUS_IMAGE_ID" >/dev/null 2>&1; then
 fi
 
 # Ensure the previous slot is running the exact recorded image.
-if ! docker container inspect "$CONTAINER" >/dev/null 2>&1 ||
-   [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" != "true" ]] ||
-   [[ "$(docker inspect --format '{{.Image}}' "$CONTAINER")" != "$PREVIOUS_IMAGE_ID" ]]; then
+CONTAINER_VALID=false
+if docker container inspect "$CONTAINER" >/dev/null 2>&1 &&
+   [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" == "true" ]] &&
+   [[ "$(docker inspect --format '{{.Image}}' "$CONTAINER")" == "$PREVIOUS_IMAGE_ID" ]] &&
+   docker inspect "$CONTAINER" | jq -e --arg network "$NETWORK" --arg port "$PORT" \
+     '.[0].NetworkSettings.Networks[$network] != null and
+      .[0].HostConfig.PortBindings["8080/tcp"][0].HostIp == "127.0.0.1" and
+      .[0].HostConfig.PortBindings["8080/tcp"][0].HostPort == $port' >/dev/null; then
+    CONTAINER_VALID=true
+fi
+
+if [[ "$CONTAINER_VALID" != "true" ]]; then
 
     echo "Recreating previous slot from exact image ID $PREVIOUS_IMAGE_ID"
 
@@ -138,30 +147,53 @@ if ! docker container inspect "$CONTAINER" >/dev/null 2>&1 ||
         --name "$CONTAINER" \
         --restart unless-stopped \
         --network "$NETWORK" \
-        -p "127.0.0.1:${PORT}:80" \
+        -p "127.0.0.1:${PORT}:${CONTAINER_PORT}" \
         "$PREVIOUS_IMAGE_ID" >/dev/null
 fi
 
-# Check the previous app response. Older releases may legitimately lack /health.
+# Validate HTTP availability only; do not depend on application response text.
 PREVIOUS_OK=false
-
 for attempt in $(seq 1 15); do
-    RESPONSE=$(curl -fsS --max-time 3 \
-        "http://127.0.0.1:${PORT}/app.txt" 2>/dev/null || true)
-
-    if [[ -n "$RESPONSE" && "$RESPONSE" == "$PREVIOUS_EXPECTED" ]]; then
+    if curl -fsS --max-time 3 -o /dev/null \
+        "http://127.0.0.1:${PORT}${HEALTH_PATH}" 2>/dev/null; then
         PREVIOUS_OK=true
         break
     fi
-
     sleep 2
 done
 
 [[ "$PREVIOUS_OK" == "true" ]] || {
-    echo "ERROR: Previous release failed its application response check."
+    echo "ERROR: Previous slot health endpoint did not return a successful HTTP status."
     echo "Production route remains unchanged."
     exit 1
 }
+
+META_TMP=$(mktemp "$STATE_DIR/releases.json.XXXXXX")
+
+jq -n \
+    --arg active_slot "$PREVIOUS_SLOT" \
+    --arg active_image "$PREVIOUS_IMAGE" \
+    --arg active_image_id "$PREVIOUS_IMAGE_ID" \
+    --arg active_digest "$PREVIOUS_DIGEST" \
+    --arg previous_slot "$ACTIVE_SLOT" \
+    --arg previous_image "$ACTIVE_IMAGE" \
+    --arg previous_image_id "$ACTIVE_IMAGE_ID" \
+    --arg previous_digest "$ACTIVE_DIGEST" \
+    '{
+        active: {
+            slot: $active_slot,
+            image: $active_image,
+            image_id: $active_image_id,
+            digest: $active_digest
+        },
+        previous: {
+            slot: $previous_slot,
+            image: $previous_image,
+            image_id: $previous_image_id,
+            digest: $previous_digest
+        }
+    }' > "$META_TMP"
+
 
 # Record the original config and prepare the replacement in the same directory.
 BACKUP=$(mktemp)
@@ -170,7 +202,7 @@ cp "$CONFIG" "$BACKUP"
 TMP=$(mktemp "$ROOT/nginx/default.conf.XXXXXX")
 
 cleanup() {
-    rm -f "${TMP:-}" "${BACKUP:-}"
+    rm -f "${TMP:-}" "${BACKUP:-}" "${META_TMP:-}"
 }
 trap cleanup EXIT
 
@@ -180,7 +212,7 @@ server {
     server_name _;
 
     location / {
-        proxy_pass http://cicd-${PREVIOUS_SLOT}:80;
+        proxy_pass http://cicd-${PREVIOUS_SLOT}:${CONTAINER_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -189,19 +221,16 @@ server {
 }
 NGINX
 
+# Journal previous route + metadata before changing production routing.
+txn_begin false
+trap 'rc=$?; txn_recover || echo "CRITICAL: transaction recovery failed"; exit "$rc"' ERR
+
 # Switch config atomically. The directory mount makes the new file visible.
 mv "$TMP" "$CONFIG"
 TMP=""
 
 restore_original_route() {
-    local restore_tmp
-    restore_tmp=$(mktemp "$ROOT/nginx/default.conf.restore.XXXXXX")
-
-    cp "$BACKUP" "$restore_tmp"
-    mv "$restore_tmp" "$CONFIG"
-
-    docker exec "$PROXY" nginx -t &&
-        docker exec "$PROXY" nginx -s reload
+    txn_recover
 }
 
 if ! docker exec "$PROXY" nginx -t ||
@@ -216,18 +245,14 @@ if ! docker exec "$PROXY" nginx -t ||
     exit 1
 fi
 
-# Verify production returns the recorded previous application response.
+# Verify production health by HTTP status, not response body.
 VERIFIED=false
-
 for attempt in $(seq 1 10); do
-    RESPONSE=$(curl -fsS --max-time 3 \
-        http://127.0.0.1/app.txt 2>/dev/null || true)
-
-    if [[ -n "$RESPONSE" && "$RESPONSE" == "$PREVIOUS_EXPECTED" ]]; then
+    if curl -fsS --max-time 3 -o /dev/null \
+        "${PUBLIC_URL}${HEALTH_PATH}" 2>/dev/null; then
         VERIFIED=true
         break
     fi
-
     sleep 2
 done
 
@@ -243,39 +268,11 @@ if [[ "$VERIFIED" != "true" ]]; then
 fi
 
 # Swap the active and previous release metadata only after verification.
-META_TMP=$(mktemp "$STATE_DIR/releases.json.XXXXXX")
-
-jq -n \
-    --arg active_slot "$PREVIOUS_SLOT" \
-    --arg active_image "$PREVIOUS_IMAGE" \
-    --arg active_image_id "$PREVIOUS_IMAGE_ID" \
-    --arg active_digest "$PREVIOUS_DIGEST" \
-    --arg active_expected "$PREVIOUS_EXPECTED" \
-    --arg previous_slot "$ACTIVE_SLOT" \
-    --arg previous_image "$ACTIVE_IMAGE" \
-    --arg previous_image_id "$ACTIVE_IMAGE_ID" \
-    --arg previous_digest "$ACTIVE_DIGEST" \
-    --arg previous_expected "$ACTIVE_EXPECTED" \
-    '{
-        active: {
-            slot: $active_slot,
-            image: $active_image,
-            image_id: $active_image_id,
-            digest: $active_digest,
-            expected: $active_expected
-        },
-        previous: {
-            slot: $previous_slot,
-            image: $previous_image,
-            image_id: $previous_image_id,
-            digest: $previous_digest,
-            expected: $previous_expected
-        }
-    }' > "$META_TMP"
-
 chmod 600 "$META_TMP"
 mv "$META_TMP" "$RELEASES"
 
 printf '%s\n' "$PREVIOUS_SLOT" > "$STATE_DIR/active-slot.txt"
+txn_commit
+trap - ERR
 
 echo "ROLLBACK SUCCESS: Production now routes to $PREVIOUS_SLOT ($PREVIOUS_IMAGE)."
