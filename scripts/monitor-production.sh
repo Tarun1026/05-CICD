@@ -8,10 +8,11 @@ STATE_DIR="$ROOT/monitor"
 RELEASES="$ROOT/rollback/releases.json"
 ROLLBACK_SCRIPT="/usr/local/sbin/rollback-app.sh"
 PUBLIC_URL="http://127.0.0.1"
-HEALTH_PATH="/health"
+HEALTH_PATH="/health/ready"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-30}"
 FAILURE_THRESHOLD="${FAILURE_THRESHOLD:-3}"
 REPEAT_ALERT_SECONDS="${REPEAT_ALERT_SECONDS:-600}"
+HEALTHY_RECOVERY_THRESHOLD="${HEALTHY_RECOVERY_THRESHOLD:-3}"
 SNS_TOPIC_ARN="${SNS_TOPIC_ARN:?Set SNS_TOPIC_ARN in the systemd service environment}"
 AWS_REGION="${AWS_REGION:?Set AWS_REGION in the systemd service environment}"
 
@@ -58,13 +59,17 @@ read_state() {
   ROLLBACK_ATTEMPTED="false"
   LAST_ALERT=0
   INCIDENT_START=0
-  if [[ -r "$STATE_FILE" ]]; then
+  HEALTHY_CHECKS=0
+  ROLLBACK_STATUS="none"
+  if [[ -r "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1; then
     # State is a JSON file written by this script.
     INCIDENT="$(jq -r '.incident // false' "$STATE_FILE")"
     FAILURES="$(jq -r '.failures // 0' "$STATE_FILE")"
     ROLLBACK_ATTEMPTED="$(jq -r '.rollback_attempted // false' "$STATE_FILE")"
     LAST_ALERT="$(jq -r '.last_alert // 0' "$STATE_FILE")"
     INCIDENT_START="$(jq -r '.incident_start // 0' "$STATE_FILE")"
+    HEALTHY_CHECKS="$(jq -r '.healthy_checks // 0' "$STATE_FILE")"
+    ROLLBACK_STATUS="$(jq -r '.rollback_status // "none"' "$STATE_FILE")"
   fi
 }
 
@@ -77,7 +82,9 @@ save_state() {
     --argjson rollback_attempted "$ROLLBACK_ATTEMPTED" \
     --argjson last_alert "$LAST_ALERT" \
     --argjson incident_start "$INCIDENT_START" \
-    '{incident:$incident,failures:$failures,rollback_attempted:$rollback_attempted,last_alert:$last_alert,incident_start:$incident_start}' > "$tmp"
+    --argjson healthy_checks "$HEALTHY_CHECKS" \
+    --arg rollback_status "$ROLLBACK_STATUS" \
+    '{incident:$incident,failures:$failures,rollback_attempted:$rollback_attempted,last_alert:$last_alert,incident_start:$incident_start,healthy_checks:$healthy_checks,rollback_status:$rollback_status}' > "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$STATE_FILE"
 }
@@ -88,20 +95,31 @@ while true; do
 
   if is_healthy; then
     if [[ "$INCIDENT" == "true" ]]; then
-      DURATION=$((NOW - INCIDENT_START))
-      notify "Blue-Green service recovered" \
-        "Production health checks recovered on $(hostname). Incident duration: ${DURATION}s. Check ${LOG_FILE} and release metadata for rollback outcome."
-      log "Health recovered; incident cleared after ${DURATION}s."
+      HEALTHY_CHECKS=$((HEALTHY_CHECKS + 1))
+      log "Health recovered (${HEALTHY_CHECKS}/${HEALTHY_RECOVERY_THRESHOLD} consecutive checks)."
+      if [[ "$HEALTHY_CHECKS" -ge "$HEALTHY_RECOVERY_THRESHOLD" ]]; then
+        DURATION=$((NOW - INCIDENT_START))
+        notify "Blue-Green service recovered" \
+          "Production passed ${HEALTHY_CHECKS} consecutive health checks on $(hostname). Incident duration: ${DURATION}s. Rollback status=${ROLLBACK_STATUS}."
+        log "Incident cleared after stable recovery (${DURATION}s)."
+        INCIDENT="false"
+        FAILURES=0
+        ROLLBACK_ATTEMPTED="false"
+        ROLLBACK_STATUS="none"
+        LAST_ALERT=0
+        INCIDENT_START=0
+        HEALTHY_CHECKS=0
+      fi
+    else
+      FAILURES=0
+      HEALTHY_CHECKS=0
     fi
-    INCIDENT="false"
-    FAILURES=0
-    ROLLBACK_ATTEMPTED="false"
-    LAST_ALERT=0
-    INCIDENT_START=0
     save_state
     sleep "$INTERVAL_SECONDS"
     continue
   fi
+
+  HEALTHY_CHECKS=0
 
   FAILURES=$((FAILURES + 1))
   log "Production health check failed (${FAILURES}/${FAILURE_THRESHOLD})."
@@ -111,6 +129,8 @@ while true; do
     INCIDENT_START="$NOW"
     LAST_ALERT="$NOW"
     ROLLBACK_ATTEMPTED="false"
+    ROLLBACK_STATUS="pending"
+    HEALTHY_CHECKS=0
     save_state
 
     ACTIVE_SLOT="$(jq -r '.active.slot // "unknown"' "$RELEASES" 2>/dev/null || echo unknown)"
@@ -133,6 +153,8 @@ while true; do
 
       if bash "$ROLLBACK_SCRIPT"; then
         ROLLBACK_DONE="true"
+        ROLLBACK_STATUS="succeeded"
+        save_state
         log "Automatic rollback script returned success."
         notify "Blue-Green automatic rollback initiated" \
           "Rollback script returned success on $(hostname). The monitor will verify production health on subsequent checks."
@@ -148,12 +170,16 @@ while true; do
           sleep "$LOCK_RETRY_DELAY"
         fi
       else
+        ROLLBACK_STATUS="failed"
+        save_state
         log "CRITICAL: Rollback failed with exit code ${rollback_rc}; not retrying."
         break
       fi
     done
 
     if [[ "$ROLLBACK_DONE" != "true" ]]; then
+      ROLLBACK_STATUS="failed"
+      save_state
       log "CRITICAL: Automatic rollback did not complete."
       notify "CRITICAL: Blue-Green automatic rollback failed" \
         "Rollback did not complete on $(hostname). Check ${LOG_FILE}, ${ROOT}/rollback/releases.json, and Nginx/container logs."

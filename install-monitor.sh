@@ -11,6 +11,7 @@ set -Eeuo pipefail
 
 install -m 0750 scripts/monitor-production.sh /usr/local/sbin/monitor-production.sh
 install -m 0750 scripts/rollback-app.sh /usr/local/sbin/rollback-app.sh
+install -m 0750 scripts/transaction-lib.sh /usr/local/sbin/transaction-lib.sh
 mkdir -p /etc/blue-green
 cat > /etc/blue-green/monitor.env <<EOF
 AWS_REGION=${AWS_REGION}

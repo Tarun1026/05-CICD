@@ -9,8 +9,12 @@ RELEASES="$STATE_DIR/releases.json"
 NETWORK="blue-green-net"
 PROXY="nginx-proxy"
 LOCK="/var/lock/cicd-blue-green-deploy.lock"
+CONTAINER_PORT=8080
+PUBLIC_URL="http://127.0.0.1"
+HEALTH_PATH="/health/ready"
+source "$(dirname "$0")/transaction-lib.sh"
 
-for cmd in docker curl flock jq mktemp; do
+for cmd in docker curl flock jq mktemp seq base64 install; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Missing command: $cmd"
         exit 1
@@ -23,6 +27,9 @@ flock -n 9 || {
     echo "LOCK_BUSY: Another deployment or rollback is running."
     exit 75
 }
+
+# Recover an interrupted route/metadata transaction before reading release state.
+txn_recover
 
 [[ -r "$RELEASES" ]] || {
     echo "ERROR: Missing release metadata; refusing rollback."
@@ -60,9 +67,9 @@ ACTIVE_IMAGE_ID=$(jq -r '.active.image_id // empty' "$RELEASES")
 ACTIVE_DIGEST=$(jq -r '.active.digest // empty' "$RELEASES")
 
 # Ensure saved metadata agrees with the live production route.
-if grep -Fq 'proxy_pass http://cicd-blue:80;' "$CONFIG"; then
+if grep -Fq 'proxy_pass http://cicd-blue:8080;' "$CONFIG"; then
     LIVE_SLOT="blue"
-elif grep -Fq 'proxy_pass http://cicd-green:80;' "$CONFIG"; then
+elif grep -Fq 'proxy_pass http://cicd-green:8080;' "$CONFIG"; then
     LIVE_SLOT="green"
 else
     echo "ERROR: Cannot determine live production slot from Nginx config."
@@ -119,9 +126,18 @@ if ! docker image inspect "$PREVIOUS_IMAGE_ID" >/dev/null 2>&1; then
 fi
 
 # Ensure the previous slot is running the exact recorded image.
-if ! docker container inspect "$CONTAINER" >/dev/null 2>&1 ||
-   [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" != "true" ]] ||
-   [[ "$(docker inspect --format '{{.Image}}' "$CONTAINER")" != "$PREVIOUS_IMAGE_ID" ]]; then
+CONTAINER_VALID=false
+if docker container inspect "$CONTAINER" >/dev/null 2>&1 &&
+   [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" == "true" ]] &&
+   [[ "$(docker inspect --format '{{.Image}}' "$CONTAINER")" == "$PREVIOUS_IMAGE_ID" ]] &&
+   docker inspect "$CONTAINER" | jq -e --arg network "$NETWORK" --arg port "$PORT" \
+     '.[0].NetworkSettings.Networks[$network] != null and
+      .[0].HostConfig.PortBindings["8080/tcp"][0].HostIp == "127.0.0.1" and
+      .[0].HostConfig.PortBindings["8080/tcp"][0].HostPort == $port' >/dev/null; then
+    CONTAINER_VALID=true
+fi
+
+if [[ "$CONTAINER_VALID" != "true" ]]; then
 
     echo "Recreating previous slot from exact image ID $PREVIOUS_IMAGE_ID"
 
@@ -131,7 +147,7 @@ if ! docker container inspect "$CONTAINER" >/dev/null 2>&1 ||
         --name "$CONTAINER" \
         --restart unless-stopped \
         --network "$NETWORK" \
-        -p "127.0.0.1:${PORT}:80" \
+        -p "127.0.0.1:${PORT}:${CONTAINER_PORT}" \
         "$PREVIOUS_IMAGE_ID" >/dev/null
 fi
 
@@ -139,7 +155,7 @@ fi
 PREVIOUS_OK=false
 for attempt in $(seq 1 15); do
     if curl -fsS --max-time 3 -o /dev/null \
-        "http://127.0.0.1:${PORT}/health" 2>/dev/null; then
+        "http://127.0.0.1:${PORT}${HEALTH_PATH}" 2>/dev/null; then
         PREVIOUS_OK=true
         break
     fi
@@ -152,82 +168,6 @@ done
     exit 1
 }
 
-# Record the original config and prepare the replacement in the same directory.
-BACKUP=$(mktemp)
-cp "$CONFIG" "$BACKUP"
-
-TMP=$(mktemp "$ROOT/nginx/default.conf.XXXXXX")
-
-cleanup() {
-    rm -f "${TMP:-}" "${BACKUP:-}"
-}
-trap cleanup EXIT
-
-cat > "$TMP" <<NGINX
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass http://cicd-${PREVIOUS_SLOT}:80;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-NGINX
-
-# Switch config atomically. The directory mount makes the new file visible.
-mv "$TMP" "$CONFIG"
-TMP=""
-
-restore_original_route() {
-    local restore_tmp
-    restore_tmp=$(mktemp "$ROOT/nginx/default.conf.restore.XXXXXX")
-
-    cp "$BACKUP" "$restore_tmp"
-    mv "$restore_tmp" "$CONFIG"
-
-    docker exec "$PROXY" nginx -t &&
-        docker exec "$PROXY" nginx -s reload
-}
-
-if ! docker exec "$PROXY" nginx -t ||
-   ! docker exec "$PROXY" nginx -s reload; then
-    echo "ERROR: Nginx validation or reload failed; restoring original route."
-
-    restore_original_route || {
-        echo "CRITICAL: Could not restore the original route."
-        exit 1
-    }
-
-    exit 1
-fi
-
-# Verify production health by HTTP status, not response body.
-VERIFIED=false
-for attempt in $(seq 1 10); do
-    if curl -fsS --max-time 3 -o /dev/null \
-        http://127.0.0.1/health 2>/dev/null; then
-        VERIFIED=true
-        break
-    fi
-    sleep 2
-done
-
-if [[ "$VERIFIED" != "true" ]]; then
-    echo "ERROR: Production verification failed; restoring original route."
-
-    restore_original_route || {
-        echo "CRITICAL: Original route restoration failed."
-        exit 1
-    }
-
-    exit 1
-fi
-
-# Swap the active and previous release metadata only after verification.
 META_TMP=$(mktemp "$STATE_DIR/releases.json.XXXXXX")
 
 jq -n \
@@ -254,9 +194,85 @@ jq -n \
         }
     }' > "$META_TMP"
 
+
+# Record the original config and prepare the replacement in the same directory.
+BACKUP=$(mktemp)
+cp "$CONFIG" "$BACKUP"
+
+TMP=$(mktemp "$ROOT/nginx/default.conf.XXXXXX")
+
+cleanup() {
+    rm -f "${TMP:-}" "${BACKUP:-}" "${META_TMP:-}"
+}
+trap cleanup EXIT
+
+cat > "$TMP" <<NGINX
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://cicd-${PREVIOUS_SLOT}:${CONTAINER_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+
+# Journal previous route + metadata before changing production routing.
+txn_begin false
+trap 'rc=$?; txn_recover || echo "CRITICAL: transaction recovery failed"; exit "$rc"' ERR
+
+# Switch config atomically. The directory mount makes the new file visible.
+mv "$TMP" "$CONFIG"
+TMP=""
+
+restore_original_route() {
+    txn_recover
+}
+
+if ! docker exec "$PROXY" nginx -t ||
+   ! docker exec "$PROXY" nginx -s reload; then
+    echo "ERROR: Nginx validation or reload failed; restoring original route."
+
+    restore_original_route || {
+        echo "CRITICAL: Could not restore the original route."
+        exit 1
+    }
+
+    exit 1
+fi
+
+# Verify production health by HTTP status, not response body.
+VERIFIED=false
+for attempt in $(seq 1 10); do
+    if curl -fsS --max-time 3 -o /dev/null \
+        "${PUBLIC_URL}${HEALTH_PATH}" 2>/dev/null; then
+        VERIFIED=true
+        break
+    fi
+    sleep 2
+done
+
+if [[ "$VERIFIED" != "true" ]]; then
+    echo "ERROR: Production verification failed; restoring original route."
+
+    restore_original_route || {
+        echo "CRITICAL: Original route restoration failed."
+        exit 1
+    }
+
+    exit 1
+fi
+
+# Swap the active and previous release metadata only after verification.
 chmod 600 "$META_TMP"
 mv "$META_TMP" "$RELEASES"
 
 printf '%s\n' "$PREVIOUS_SLOT" > "$STATE_DIR/active-slot.txt"
+txn_commit
+trap - ERR
 
 echo "ROLLBACK SUCCESS: Production now routes to $PREVIOUS_SLOT ($PREVIOUS_IMAGE)."

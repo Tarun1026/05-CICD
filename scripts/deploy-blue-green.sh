@@ -16,10 +16,11 @@ NETWORK="blue-green-net"
 PROXY="nginx-proxy"
 LOCK="/var/lock/cicd-blue-green-deploy.lock"
 PUBLIC_URL="http://127.0.0.1"
-HEALTH_PATH="/health"
-APP_PATH="/app.txt"
+CONTAINER_PORT=8080
+HEALTH_PATH="/health/ready"
+source "$(dirname "$0")/transaction-lib.sh"
 
-for cmd in docker curl flock jq mktemp ss awk grep; do
+for cmd in docker curl flock jq mktemp ss awk grep seq base64 install; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Required command missing: $cmd"
         exit 1
@@ -35,9 +36,12 @@ mkdir -p "$ROOT/nginx" "$STATE_DIR"
 
 exec 9>"$LOCK"
 flock -n 9 || {
-    echo "ERROR: Another deployment or rollback is running."
-    exit 1
+    echo "LOCK_BUSY: Another deployment or rollback is running."
+    exit 75
 }
+
+# Recover an interrupted route/metadata transaction before inspecting live state.
+txn_recover
 
 if ! docker network inspect "$NETWORK" >/dev/null 2>&1; then
     docker network create "$NETWORK" >/dev/null
@@ -46,10 +50,10 @@ fi
 # Identify the active production slot from the host configuration.
 ACTIVE=""
 if [[ -f "$CONFIG" ]] &&
-   docker ps --format '{{.Names}}' | grep -qx "$PROXY"; then
-    if grep -Fq 'proxy_pass http://cicd-blue:80;' "$CONFIG"; then
+   docker container inspect "$PROXY" >/dev/null 2>&1; then
+    if grep -Fq 'proxy_pass http://cicd-blue:8080;' "$CONFIG"; then
         ACTIVE="blue"
-    elif grep -Fq 'proxy_pass http://cicd-green:80;' "$CONFIG"; then
+    elif grep -Fq 'proxy_pass http://cicd-green:8080;' "$CONFIG"; then
         ACTIVE="green"
     fi
 fi
@@ -57,8 +61,10 @@ fi
 BOOTSTRAP=false
 
 if [[ -z "$ACTIVE" ]]; then
-    if docker ps --format '{{.Names}}' | grep -qx "$PROXY"; then
-        echo "ERROR: Running proxy has an ambiguous active slot."
+    if docker container inspect "$PROXY" >/dev/null 2>&1; then
+        echo "ERROR: Running proxy has an unrecognized active route."
+        echo "If it still points to cicd-blue:80 or cicd-green:80, it is the legacy Nginx app."
+        echo "Migrate the proxy and slot containers to the Go app on port 8080 before deploying."
         echo "Refusing to change production routing."
         exit 1
     fi
@@ -79,7 +85,6 @@ fi
 ACTIVE_IMAGE=""
 ACTIVE_IMAGE_ID=""
 ACTIVE_DIGEST=""
-ACTIVE_EXPECTED=""
 
 if [[ "$BOOTSTRAP" == false ]]; then
     if ! docker container inspect "cicd-$ACTIVE" >/dev/null 2>&1; then
@@ -96,16 +101,10 @@ if [[ "$BOOTSTRAP" == false ]]; then
     ACTIVE_PORT=8081
     [[ "$ACTIVE" == "green" ]] && ACTIVE_PORT=8082
 
-    # Legacy active releases may not provide /health.
-    # Preserve production as long as the application response is available.
-    ACTIVE_EXPECTED=$(curl -fsS --max-time 5 \
-        "http://127.0.0.1:${ACTIVE_PORT}${APP_PATH}") || {
-        echo "ERROR: Active application response check failed."
-        exit 1
-    }
-
-    [[ -n "$ACTIVE_EXPECTED" ]] || {
-        echo "ERROR: Active application response is empty."
+    # Validate availability by HTTP status only; response bodies are app-specific.
+    curl -fsS --max-time 5 -o /dev/null \
+        "http://127.0.0.1:${ACTIVE_PORT}${HEALTH_PATH}" || {
+        echo "ERROR: Active slot health endpoint failed."
         exit 1
     }
 fi
@@ -144,20 +143,14 @@ trap cleanup_candidate EXIT
 docker run -d \
     --name "$CANDIDATE_CONTAINER" \
     --network "$NETWORK" \
-    -p "127.0.0.1:${CANDIDATE_PORT}:80" \
+    -p "127.0.0.1:${CANDIDATE_PORT}:${CONTAINER_PORT}" \
     "$CANDIDATE_ID" >/dev/null
 
 CANDIDATE_OK=false
-CANDIDATE_EXPECTED=""
 
 for attempt in $(seq 1 15); do
-    HEALTH=$(curl -fsS --max-time 3 \
-        "http://127.0.0.1:${CANDIDATE_PORT}${HEALTH_PATH}" 2>/dev/null || true)
-    RESPONSE=$(curl -fsS --max-time 3 \
-        "http://127.0.0.1:${CANDIDATE_PORT}${APP_PATH}" 2>/dev/null || true)
-
-    if [[ -n "$HEALTH" && -n "$RESPONSE" ]]; then
-        CANDIDATE_EXPECTED="$RESPONSE"
+    if curl -fsS --max-time 3 -o /dev/null \
+        "http://127.0.0.1:${CANDIDATE_PORT}${HEALTH_PATH}" 2>/dev/null; then
         CANDIDATE_OK=true
         break
     fi
@@ -165,7 +158,7 @@ for attempt in $(seq 1 15); do
 done
 
 if [[ "$CANDIDATE_OK" != true ]]; then
-    echo "ERROR: Candidate failed /health or /app.txt validation."
+    echo "ERROR: Candidate health endpoint did not return a successful HTTP status."
     echo "Production and the standby slot have not been changed."
     exit 1
 fi
@@ -187,7 +180,7 @@ restore_standby() {
             --name "$TARGET_CONTAINER" \
             --restart unless-stopped \
             --network "$NETWORK" \
-            -p "127.0.0.1:${TARGET_PORT}:80" \
+            -p "127.0.0.1:${TARGET_PORT}:${CONTAINER_PORT}" \
             "$OLD_TARGET_ID" >/dev/null
     fi
 }
@@ -196,7 +189,7 @@ if ! docker run -d \
     --name "$TARGET_CONTAINER" \
     --restart unless-stopped \
     --network "$NETWORK" \
-    -p "127.0.0.1:${TARGET_PORT}:80" \
+    -p "127.0.0.1:${TARGET_PORT}:${CONTAINER_PORT}" \
     "$CANDIDATE_ID" >/dev/null; then
     echo "ERROR: Could not start candidate in standby slot."
     restore_standby || echo "CRITICAL: Standby restoration failed."
@@ -205,12 +198,8 @@ fi
 
 STANDBY_OK=false
 for attempt in $(seq 1 15); do
-    H=$(curl -fsS --max-time 3 \
-        "http://127.0.0.1:${TARGET_PORT}${HEALTH_PATH}" 2>/dev/null || true)
-    R=$(curl -fsS --max-time 3 \
-        "http://127.0.0.1:${TARGET_PORT}${APP_PATH}" 2>/dev/null || true)
-
-    if [[ -n "$H" && "$R" == "$CANDIDATE_EXPECTED" ]]; then
+    if curl -fsS --max-time 3 -o /dev/null \
+        "http://127.0.0.1:${TARGET_PORT}${HEALTH_PATH}" 2>/dev/null; then
         STANDBY_OK=true
         break
     fi
@@ -223,6 +212,33 @@ if [[ "$STANDBY_OK" != true ]]; then
     restore_standby || echo "CRITICAL: Standby restoration failed."
     exit 1
 fi
+
+META_TMP=$(mktemp "$STATE_DIR/releases.json.XXXXXX")
+
+jq -n \
+    --arg active_slot "$TARGET" \
+    --arg active_image "$IMAGE" \
+    --arg active_image_id "$CANDIDATE_ID" \
+    --arg active_digest "$CANDIDATE_DIGEST" \
+    --arg previous_slot "${ACTIVE:-}" \
+    --arg previous_image "$ACTIVE_IMAGE" \
+    --arg previous_image_id "$ACTIVE_IMAGE_ID" \
+    --arg previous_digest "$ACTIVE_DIGEST" \
+    '{
+        active: {
+            slot: $active_slot,
+            image: $active_image,
+            image_id: $active_image_id,
+            digest: $active_digest
+        },
+        previous: {
+            slot: $previous_slot,
+            image: $previous_image,
+            image_id: $previous_image_id,
+            digest: $previous_digest
+        }
+    }' > "$META_TMP"
+
 
 # Save the current route for recovery.
 BACKUP=""
@@ -243,7 +259,7 @@ server {
     server_name _;
 
     location / {
-        proxy_pass http://cicd-${slot}:80;
+        proxy_pass http://cicd-${slot}:${CONTAINER_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -254,32 +270,12 @@ NGINX
 }
 
 write_config "$TARGET" "$TMP_CONFIG"
+txn_begin "$BOOTSTRAP"
+trap 'rc=$?; txn_recover || echo "CRITICAL: transaction recovery failed"; exit "$rc"' ERR
 mv "$TMP_CONFIG" "$CONFIG"
 
 restore_route() {
-    if [[ "$BOOTSTRAP" == true ]]; then
-        docker rm -f "$PROXY" >/dev/null 2>&1 || true
-        return 0
-    fi
-
-    # Restore the old route through a replacement file in the mounted directory.
-    local restore_tmp
-    restore_tmp=$(mktemp "$ROOT/nginx/default.conf.restore.XXXXXX")
-    cp "$BACKUP" "$restore_tmp"
-    mv "$restore_tmp" "$CONFIG"
-
-    docker exec "$PROXY" nginx -t &&
-        docker exec "$PROXY" nginx -s reload || return 1
-
-    local port expected
-    port=8081
-    [[ "$ACTIVE" == "green" ]] && port=8082
-
-    expected=$(curl -fsS --max-time 5 \
-        "http://127.0.0.1:${port}${APP_PATH}") || return 1
-
-    [[ "$expected" == "$ACTIVE_EXPECTED" ]] &&
-        [[ "$(curl -fsS --max-time 5 "${PUBLIC_URL}${APP_PATH}")" == "$ACTIVE_EXPECTED" ]]
+    txn_recover
 }
 
 # Bootstrap uses a directory mount. Existing proxies must be migrated separately
@@ -293,6 +289,7 @@ if [[ "$BOOTSTRAP" == true ]]; then
         -v "$ROOT/nginx:/etc/nginx/conf.d:ro" \
         nginx:alpine >/dev/null; then
         echo "ERROR: Could not start initial proxy."
+        restore_route || true
         exit 1
     fi
 else
@@ -314,6 +311,8 @@ else
        ! docker exec "$PROXY" nginx -s reload; then
         echo "ERROR: Nginx validation/reload failed."
         restore_route || echo "CRITICAL: Route restoration failed."
+        docker rm -f "$TARGET_CONTAINER" >/dev/null 2>&1 || true
+        restore_standby || echo "CRITICAL: Standby restoration failed."
         rm -f "$BACKUP"
         exit 1
     fi
@@ -321,13 +320,8 @@ fi
 
 PROD_OK=false
 for attempt in $(seq 1 15); do
-    PROD_HEALTH=$(curl -fsS --max-time 3 \
-        "${PUBLIC_URL}${HEALTH_PATH}" 2>/dev/null || true)
-    PROD_RESPONSE=$(curl -fsS --max-time 3 \
-        "${PUBLIC_URL}${APP_PATH}" 2>/dev/null || true)
-
-    if [[ -n "$PROD_HEALTH" &&
-          "$PROD_RESPONSE" == "$CANDIDATE_EXPECTED" ]]; then
+    if curl -fsS --max-time 3 -o /dev/null \
+        "${PUBLIC_URL}${HEALTH_PATH}" 2>/dev/null; then
         PROD_OK=true
         break
     fi
@@ -337,44 +331,18 @@ done
 if [[ "$PROD_OK" != true ]]; then
     echo "ERROR: Production verification failed; restoring previous route."
     restore_route || echo "CRITICAL: Automatic route restoration failed."
+    docker rm -f "$TARGET_CONTAINER" >/dev/null 2>&1 || true
+    restore_standby || echo "CRITICAL: Standby restoration failed."
     rm -f "$BACKUP"
     exit 1
 fi
-
-META_TMP=$(mktemp "$STATE_DIR/releases.json.XXXXXX")
-
-jq -n \
-    --arg active_slot "$TARGET" \
-    --arg active_image "$IMAGE" \
-    --arg active_image_id "$CANDIDATE_ID" \
-    --arg active_digest "$CANDIDATE_DIGEST" \
-    --arg active_expected "$CANDIDATE_EXPECTED" \
-    --arg previous_slot "${ACTIVE:-}" \
-    --arg previous_image "$ACTIVE_IMAGE" \
-    --arg previous_image_id "$ACTIVE_IMAGE_ID" \
-    --arg previous_digest "$ACTIVE_DIGEST" \
-    --arg previous_expected "$ACTIVE_EXPECTED" \
-    '{
-        active: {
-            slot: $active_slot,
-            image: $active_image,
-            image_id: $active_image_id,
-            digest: $active_digest,
-            expected: $active_expected
-        },
-        previous: {
-            slot: $previous_slot,
-            image: $previous_image,
-            image_id: $previous_image_id,
-            digest: $previous_digest,
-            expected: $previous_expected
-        }
-    }' > "$META_TMP"
 
 chmod 600 "$META_TMP"
 mv "$META_TMP" "$RELEASES"
 printf '%s\n' "$TARGET" > "$STATE_DIR/active-slot.txt"
 printf '%s\n' "$IMAGE" > "$STATE_DIR/${TARGET}-image.txt"
+txn_commit
+trap - ERR
 
 [[ -z "$BACKUP" ]] || rm -f "$BACKUP"
 
